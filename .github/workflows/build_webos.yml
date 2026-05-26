@@ -13,14 +13,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Checkt ZUERST mr-yaml aus, um an das temporäre Icon heranzukommen
-    - name: Steuer-Repository (mr-yaml) auschecken
+    # 1. Steuer-Repository (mr-yaml) auschecken
+    - name: Checkout control repo
       uses: actions/checkout@v4
       with:
         path: 'control-repo'
 
-    # 2. Holt den Quellcode aus dem passiven neoos-apps
-    - name: Quell-Repository (neoos-apps) auschecken
+    # 2. Quell-Repository (neoos-apps) auschecken
+    - name: Checkout app repo
       uses: actions/checkout@v4
       with:
         repository: 'NeoOS-TV/neoos-apps'
@@ -28,36 +28,38 @@ jobs:
         fetch-depth: 0
         path: 'app-repo'
 
-    - name: Node.js einrichten
+    # 3. Node.js einrichten
+    - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: 18
 
-    - name: webOS TV CLI installieren
+    # 4. webOS TV CLI installieren
+    - name: Install webOS CLI
       run: npm install -g @webos-tools/cli
 
-    # 3. Temporäres Icon verarbeiten & App verpacken
-    - name: App Meta & Verpackung
+    # 5. App Meta & Verpackung
+    - name: Prepare App
       id: app_meta
       run: |
         FOLDER="app-repo/${{ github.event.inputs.app_folder }}"
         
-        if [ -f "$FOLDER/appinfo.json" ]; then
-          APP_ID=$(jq -r '.id' "$FOLDER/appinfo.json")
-          APP_TITLE=$(jq -r '.title' "$FOLDER/appinfo.json")
-          APP_VERSION=$(jq -r '.version' "$FOLDER/appinfo.json")
-        else
+        if [ ! -f "$FOLDER/appinfo.json" ]; then
           echo "::error::Keine appinfo.json im angegebenen Ordner gefunden!"
           exit 1
         fi
-        
+
+        APP_ID=$(jq -r '.id' "$FOLDER/appinfo.json")
+        APP_TITLE=$(jq -r '.title' "$FOLDER/appinfo.json")
+        APP_VERSION=$(jq -r '.version' "$FOLDER/appinfo.json")
+
         echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
         echo "app_title=$APP_TITLE" >> $GITHUB_OUTPUT
         echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
-        
+
         mkdir -p /tmp/release-assets
-        
-        # Temporäres Icon
+
+        # Temporäres Icon kopieren
         if [ -f "control-repo/tmp_upload_icon.png" ]; then
           echo "🎨 Temporäres Icon gefunden, überschreibe Quell-Icon..."
           cp control-repo/tmp_upload_icon.png "$FOLDER/icon.png"
@@ -69,41 +71,49 @@ jobs:
 
         echo "📦 Verpacke webOS App-Version..."
         cd app-repo && ares-package "${{ github.event.inputs.app_folder }}"
-        
+
         EXPECTED_IPK="${APP_ID}_${APP_VERSION}_all.ipk"
-        if [ -f "$EXPECTED_IPK" ]; then
-          mv "$EXPECTED_IPK" /tmp/release-assets/
-        else
+        if [ ! -f "$EXPECTED_IPK" ]; then
           echo "::error::Die IPK-Datei $EXPECTED_IPK wurde nicht erzeugt!"
           exit 1
         fi
+        mv "$EXPECTED_IPK" /tmp/release-assets/
 
-    # 4. Release im Storage-Repository erstellen
-    - name: Release erstellen & Assets hochladen
+    # 6. Release erstellen & Assets hochladen
+    - name: Create Release
       run: |
         echo "🚀 Erstelle Release im Storage-Repository..."
+        
         TAG="${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
         TITLE="${{ steps.app_meta.outputs.app_title }}"
-        
-        # Release erstellen
+
+        # Escape JSON sicher
+        TAG_ESCAPED=$(echo "$TAG" | jq -R .)
+        TITLE_ESCAPED=$(echo "$TITLE" | jq -R .)
+
+        DATA="{\"tag_name\":$TAG_ESCAPED,\"name\":$TITLE_ESCAPED,\"body\":\"Automatisches Remote-Release.\",\"draft\":false,\"prerelease\":false}"
+        echo "Payload für Release:"
+        echo "$DATA"
+
         API_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
           -H "Accept: application/vnd.github+json" \
           -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
+          -H "Content-Type: application/json" \
           https://api.github.com/repos/NeoOS-TV/NeoStore-Storage/releases \
-          -d "{\"tag_name\":\"$TAG\",\"name\":\"$TITLE\",\"body\":\"Automatisches Remote-Release.\",\"draft\":false,\"prerelease\":false}")
-        
+          -d "$DATA")
+
         echo "--- GITHUB API ANTWORT ---"
         echo "$API_RESPONSE"
         echo "--------------------------"
-        
+
         HTTP_STATUS=$(echo "$API_RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
         RELEASE_ID=$(echo "$API_RESPONSE" | grep -v "HTTP_STATUS:" | jq -r '.id' 2>/dev/null || echo "null")
-        
-        if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ] || [ "$HTTP_STATUS" -ge 400 ]; then
+
+        if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ]; then
           echo "::error::GitHub API verweigert die Erstellung (Status $HTTP_STATUS)!"
           exit 1
         fi
-        
+
         # Assets hochladen
         for FILE in /tmp/release-assets/*; do
           FILENAME=$(basename "$FILE")
@@ -117,17 +127,17 @@ jobs:
         done
         echo "✅ Release erfolgreich erstellt!"
 
-    # 5. Temporäres Icon im Repo aufräumen
-    - name: Temporäres Icon bereinigen
+    # 7. Temporäres Icon bereinigen
+    - name: Cleanup temporary icon
       if: always()
       run: |
         echo "🧹 Lösche temporäre Upload-Datei aus mr-yaml..."
         FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
           -H "Accept: application/vnd.github+json" \
           https://api.github.com/repos/NeoOS-TV/mr-yaml/contents/tmp_upload_icon.png)
-        
+
         SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-        
+
         if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
           curl -s -X DELETE \
             -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
