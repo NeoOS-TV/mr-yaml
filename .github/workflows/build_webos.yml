@@ -2,160 +2,115 @@ name: Remote App Builder
 
 on:
   workflow_dispatch:
-    inputs:
-      app_folder:
-        description: 'Pfad zum App-Ordner (z.B. apps/com.neoos.app.neocast)'
-        required: true
-        default: 'apps/com.neoos.app.neocast'
 
 jobs:
   remote-build-and-release:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Steuer-Repository (mr-yaml) auschecken
-    - name: Checkout control repo
-      uses: actions/checkout@v4
-      with:
-        path: 'control-repo'
+      # 1️⃣ Repo auschecken (mr-yaml + app)
+      - name: Checkout control repo
+        uses: actions/checkout@v4
+        with:
+          path: control-repo
 
-    # 2. Quell-Repository (neoos-apps) auschecken
-    - name: Checkout app repo
-      uses: actions/checkout@v4
-      with:
-        repository: 'NeoOS-TV/neoos-apps'
-        token: ${{ secrets.NEOTOKEN }}
-        fetch-depth: 0
-        path: 'app-repo'
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          path: app-repo
 
-    # 3. Node.js Setup
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: 18
+      # 2️⃣ Node / WebOS CLI installieren
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
-    - name: Install webOS CLI
-      run: npm install -g @webos-tools/cli
+      - name: Install webOS CLI
+        run: npm install -g @webos-tools/cli
 
-    # 4. App Meta & Packaging
-    - name: Process App & Package
-      id: app_meta
-      run: |
-        FOLDER="app-repo/${{ github.event.inputs.app_folder }}"
-        
-        if [ -f "$FOLDER/appinfo.json" ]; then
-          APP_ID=$(jq -r '.id' "$FOLDER/appinfo.json")
-          APP_TITLE=$(jq -r '.title' "$FOLDER/appinfo.json")
-          APP_VERSION=$(jq -r '.version' "$FOLDER/appinfo.json")
-        else
-          echo "::error::Keine appinfo.json im angegebenen Ordner gefunden!"
-          exit 1
-        fi
-        
-        echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
-        echo "app_title=$APP_TITLE" >> $GITHUB_OUTPUT
-        echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
-        
-        mkdir -p /tmp/release-assets
-        
-        # Temporäres Icon kopieren
-        if [ -f "control-repo/tmp_upload_icon.png" ]; then
-          echo "🎨 Temporäres Icon gefunden, überschreibe Quell-Icon..."
-          cp control-repo/tmp_upload_icon.png "$FOLDER/icon.png"
-          cp control-repo/tmp_upload_icon.png /tmp/release-assets/icon.png
-        else
-          echo "Warnung: Kein temporäres Icon im Root gefunden, nutze Standard."
-          cp "$FOLDER/icon.png" /tmp/release-assets/icon.png || touch /tmp/release-assets/icon.png
-        fi
+      # 3️⃣ App Metadata auslesen
+      - name: Read App Info
+        id: app_meta
+        run: |
+          FOLDER="app-repo/apps/com.neoos.app.neocast"
+          if [ -f "$FOLDER/appinfo.json" ]; then
+            APP_ID=$(jq -r '.id' "$FOLDER/appinfo.json")
+            APP_TITLE=$(jq -r '.title' "$FOLDER/appinfo.json")
+            APP_VERSION=$(jq -r '.version' "$FOLDER/appinfo.json")
+          else
+            echo "::error::Keine appinfo.json im angegebenen Ordner gefunden!"
+            exit 1
+          fi
+          echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
+          echo "app_title=$APP_TITLE" >> $GITHUB_OUTPUT
+          echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
 
-        echo "📦 Verpacke webOS App-Version..."
-        cd app-repo && ares-package "${{ github.event.inputs.app_folder }}"
-        
-        EXPECTED_IPK="${APP_ID}_${APP_VERSION}_all.ipk"
-        if [ -f "$EXPECTED_IPK" ]; then
-          mv "$EXPECTED_IPK" /tmp/release-assets/
-        else
-          echo "::error::Die IPK-Datei $EXPECTED_IPK wurde nicht erzeugt!"
-          exit 1
-        fi
+      # 4️⃣ App packen
+      - name: Package webOS App
+        run: |
+          FOLDER="app-repo/apps/com.neoos.app.neocast"
+          mkdir -p /tmp/release-assets
 
-    # 5. Tag erstellen und pushen (wichtig: Slash)
-    - name: Create Git Tag with Slash
-      run: |
-        TAG="${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git config --global user.name "github-actions[bot]"
-        
-        # Tag erstellen falls noch nicht existiert
-        if git rev-parse "$TAG" >/dev/null 2>&1; then
-          echo "Tag $TAG existiert bereits"
-        else
-          git tag -a "$TAG" -m "Release $TAG"
-        fi
-        
-        # Push Tag mit Slash korrekt
-        git push origin "refs/tags/$TAG"
+          # Temporäres Icon kopieren
+          if [ -f "control-repo/tmp_upload_icon.png" ]; then
+            echo "🎨 Temporäres Icon gefunden, überschreibe Quell-Icon..."
+            cp control-repo/tmp_upload_icon.png "$FOLDER/icon.png"
+            cp control-repo/tmp_upload_icon.png /tmp/release-assets/icon.png
+          else
+            echo "Warnung: Kein temporäres Icon im Root gefunden, nutze Standard."
+            cp "$FOLDER/icon.png" /tmp/release-assets/icon.png || touch /tmp/release-assets/icon.png
+          fi
 
-    # 6. Release im Storage-Repository erstellen
-    - name: Create GitHub Release
-      run: |
-        TAG="${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
-        TITLE="${{ steps.app_meta.outputs.app_title }}"
+          echo "📦 Verpacke webOS App-Version..."
+          cd app-repo
+          ares-package "apps/com.neoos.app.neocast"
 
-        echo "Payload für Release:"
-        echo "{\"tag_name\":\"$TAG\",\"name\":\"$TITLE\",\"body\":\"Automatisches Remote-Release.\",\"draft\":false,\"prerelease\":false}"
+          EXPECTED_IPK="com.neoos.app.neocast_${{ steps.app_meta.outputs.app_version }}_all.ipk"
+          if [ -f "$EXPECTED_IPK" ]; then
+            mv "$EXPECTED_IPK" /tmp/release-assets/
+          else
+            echo "::error::Die IPK-Datei $EXPECTED_IPK wurde nicht erzeugt!"
+            exit 1
+          fi
 
-        RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
-          -H "Accept: application/vnd.github+json" \
-          -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
-          -H "X-GitHub-Api-Version: 2026-03-10" \
-          -H "Content-Type: application/json" \
-          https://api.github.com/repos/NeoOS-TV/NeoStore-Storage/releases \
-          -d "{\"tag_name\":\"$TAG\",\"name\":\"$TITLE\",\"body\":\"Automatisches Remote-Release.\",\"draft\":false,\"prerelease\":false}")
+      # 5️⃣ Slash-Tag erstellen & pushen
+      - name: Create Git Tag with Slash
+        run: |
+          TAG="${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
+          cd app-repo
 
-        echo "--- GITHUB API RESPONSE ---"
-        echo "$RESPONSE"
-        echo "--------------------------"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
 
-        HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
-        RELEASE_ID=$(echo "$RESPONSE" | grep -v "HTTP_STATUS:" | jq -r '.id' 2>/dev/null || echo "null")
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG existiert bereits"
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+          fi
 
-        if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ] || [ "$HTTP_STATUS" -ge 400 ]; then
-          echo "::error::GitHub API verweigert die Erstellung (Status $HTTP_STATUS)!"
-          exit 1
-        fi
+          git push origin "refs/tags/$TAG"
 
-        # Assets hochladen
-        for FILE in /tmp/release-assets/*; do
-          FILENAME=$(basename "$FILE")
-          echo "Uploade Asset: $FILENAME..."
-          curl -s -X POST \
+      # 6️⃣ Optional: Release auf GitHub erstellen & IPK hochladen
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
+          name: "${{ steps.app_meta.outputs.app_title }}"
+          body: "Automatisches Remote-Release."
+          files: "/tmp/release-assets/*"
+
+      # 7️⃣ Temporäres Icon löschen
+      - name: Cleanup Temporary Icon
+        run: |
+          FILE_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            -H "Content-Type: application/octet-stream" \
-            "https://uploads.github.com/repos/NeoOS-TV/NeoStore-Storage/releases/$RELEASE_ID/assets?name=$FILENAME" \
-            --data-binary @"$FILE"
-        done
-        echo "✅ Release erfolgreich erstellt!"
-
-    # 7. Temporäres Icon aufräumen
-    - name: Clean up temporary icon
-      if: always()
-      run: |
-        echo "🧹 Lösche temporäre Upload-Datei aus mr-yaml..."
-        FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          -H "X-GitHub-Api-Version: 2026-03-10" \
-          https://api.github.com/repos/NeoOS-TV/mr-yaml/contents/tmp_upload_icon.png)
-        
-        SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-        if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-          curl -s -X DELETE \
-            -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            https://api.github.com/repos/NeoOS-TV/mr-yaml/contents/tmp_upload_icon.png \
-            -d "{\"message\":\"chore: Temporäres Icon nach Build entfernt [skip ci]\",\"sha\":\"$SHA\"}"
-          echo "✅ Bereinigung abgeschlossen."
-        fi
+            https://api.github.com/repos/${{ github.repository }}/contents/tmp_upload_icon.png)
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/${{ github.repository }}/contents/tmp_upload_icon.png \
+              -d "{\"message\":\"chore: Temporäres Icon nach Build entfernt [skip ci]\",\"sha\":\"$SHA\"}"
+            echo "✅ Bereinigung abgeschlossen."
+          fi
