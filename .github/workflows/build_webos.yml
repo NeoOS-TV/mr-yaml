@@ -13,25 +13,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Wir prüfen zuerst das Secret, BEVOR wir auschecken. Das verhindert den unschönen Absturz.
-    # Falls NEOTOKEN leer ist, bricht der Workflow hier mit einer klaren Erklärung ab.
-    - name: Secret-Validierung
-      run: |
-        if [ -z "${{ secrets.NEOTOKEN }}" ]; then
-          echo "::error::Das Repository-Secret 'NEOTOKEN' wurde in den Einstellungen von mr-yaml nicht gefunden oder ist leer!"
-          echo "Bitte gehe zu Settings -> Secrets and variables -> Actions und erstelle ein REPOSITORY SECRET mit dem Namen NEOTOKEN."
-          exit 1
-        else
-          echo "✅ Secret NEOTOKEN wurde erfolgreich geladen."
-        fi
+    # 1. Checkt ZUERST mr-yaml aus, um an das temporäre Icon heranzukommen
+    - name: Steuer-Repository (mr-yaml) auschecken
+      uses: actions/checkout@v4
+      with:
+        path: 'control-repo'
 
-    # 2. Holt den Code aus dem passiven neoos-apps Repository
+    # 2. Holt den Quellcode aus dem passiven neoos-apps
     - name: Quell-Repository (neoos-apps) auschecken
       uses: actions/checkout@v4
       with:
         repository: 'NeoOS-TV/neoos-apps'
         token: ${{ secrets.NEOTOKEN }}
         fetch-depth: 0
+        path: 'app-repo'
 
     - name: Node.js einrichten
       uses: actions/setup-node@v4
@@ -41,10 +36,10 @@ jobs:
     - name: webOS TV CLI installieren
       run: npm install -g @webos-tools/cli
 
-    - name: App auslesen & verpacken
+    - name: Temporäres Icon verarbeiten & App verpacken
       id: app_meta
       run: |
-        FOLDER="${{ github.event.inputs.app_folder }}"
+        FOLDER="app-repo/${{ github.event.inputs.app_folder }}"
         
         if [ -f "$FOLDER/appinfo.json" ]; then
           APP_ID=$(jq -r '.id' "$FOLDER/appinfo.json")
@@ -61,35 +56,41 @@ jobs:
         
         mkdir -p /tmp/release-assets
         
-        if [ -f "$FOLDER/icon.png" ]; then
-          cp "$FOLDER/icon.png" /tmp/release-assets/icon.png
+        # Nutzen der temporären Datei aus dem mr-yaml checkout
+        if [ -f "control-repo/tmp_upload_icon.png" ]; then
+          echo "🎨 Temporäres Icon gefunden, überschreibe Quell-Icon..."
+          cp control-repo/tmp_upload_icon.png "$FOLDER/icon.png"
+          cp control-repo/tmp_upload_icon.png /tmp/release-assets/icon.png
         else
-          touch /tmp/release-assets/icon.png
+          echo "Warnung: Kein temporäres Icon im Root gefunden, nutze Standard."
+          cp "$FOLDER/icon.png" /tmp/release-assets/icon.png || touch /tmp/release-assets/icon.png
         fi
 
         echo "📦 Verpacke webOS App-Version..."
-        ares-package $FOLDER
+        cd app-repo && ares-package "${{ github.event.inputs.app_folder }}"
         
         EXPECTED_IPK="${APP_ID}_${APP_VERSION}_all.ipk"
         if [ -f "$EXPECTED_IPK" ]; then
           mv "$EXPECTED_IPK" /tmp/release-assets/
         else
-          echo "::error::Die IPK-Datei $EXPECTED_IPK wurde von ares-package nicht erzeugt!"
+          echo "::error::Die IPK-Datei $EXPECTED_IPK wurde nicht erzeugt!"
           exit 1
         fi
 
-    # 3. Erstellt das Release direkt im Storage Repo und gibt die echte API-Antwort aus
+    # 3. Erstellt das Release mit den EXAKTEN Dokumentations-Headers (Version 2026-03-10)
     - name: Release im Speicher-Repository erstellen
       run: |
         echo "🚀 Erstelle Release im Storage-Repository..."
         TAG="${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
         TITLE="${{ steps.app_meta.outputs.app_title }}"
         
+        # Nutzen der exakten Dokumentationsvorgaben inkl. API-Version
         API_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+          -H "Accept: application/vnd.github+json" \
           -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
-          -H "Accept: application/vnd.github.v3+json" \
+          -H "X-GitHub-Api-Version: 2026-03-10" \
           https://api.github.com/repos/NeoOS-TV/NeoStore-Storage/releases \
-          -d "{\"tag_name\":\"$TAG\",\"name\":\"$TITLE\",\"body\":\"Automatisches Remote-Release von mr-yaml.\"}")
+          -d "{\"tag_name\":\"$TAG\",\"name\":\"$TITLE\",\"body\":\"Automatisches Remote-Release.\",\"draft\":false,\"prerelease\":false}")
         
         echo "--- GITHUB API ANTWORT ---"
         echo "$API_RESPONSE"
@@ -99,7 +100,7 @@ jobs:
         RELEASE_ID=$(echo "$API_RESPONSE" | grep -v "HTTP_STATUS:" | jq -r '.id' 2>/dev/null || echo "null")
         
         if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ] || [ "$HTTP_STATUS" -ge 400 ]; then
-          echo "::error::GitHub API hat den Release-Request abgelehnt (Status $HTTP_STATUS)!"
+          echo "::error::GitHub API verweigert die Erstellung (Status $HTTP_STATUS)!"
           exit 1
         fi
         
@@ -107,9 +108,33 @@ jobs:
           FILENAME=$(basename "$FILE")
           echo "Uploade Asset: $FILENAME..."
           curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             -H "Content-Type: application/octet-stream" \
             "https://uploads.github.com/repos/NeoOS-TV/NeoStore-Storage/releases/$RELEASE_ID/assets?name=$FILENAME" \
             --data-binary @"$FILE"
         done
-        echo "✅ Release und alle Assets erfolgreich hochgeladen!"
+        echo "✅ Release erfolgreich erstellt!"
+
+    # 4. Bereinigt mr-yaml automatisch (Löscht die temporäre Bilddatei per API-Call)
+    - name: Temporäres Icon im Repo aufräumen
+      if: always()
+      run: |
+        echo "🧹 Lösche temporäre Upload-Datei aus mr-yaml..."
+        FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2026-03-10" \
+          https://api.github.com/repos/NeoOS-TV/mr-yaml/contents/tmp_upload_icon.png)
+        
+        SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+        
+        if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+          curl -s -X DELETE \
+            -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/repos/NeoOS-TV/mr-yaml/contents/tmp_upload_icon.png \
+            -d "{\"message\":\"chore: Temporäres Icon nach Build entfernt [skip ci]\",\"sha\":\"$SHA\"}"
+          echo "✅ Bereinigung abgeschlossen."
+        fi
