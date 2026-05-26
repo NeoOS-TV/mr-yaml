@@ -1,0 +1,115 @@
+name: Remote App Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_folder:
+        description: 'Pfad zum App-Ordner (z.B. apps/com.neoos.app.neocast)'
+        required: true
+        default: 'apps/com.neoos.app.neocast'
+
+jobs:
+  remote-build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Holt den Code aus dem passiven neoos-apps Repository über deinen Token
+    - name: Quell-Repository (neoos-apps) auschecken
+      uses: actions/checkout@v4
+      with:
+        repository: 'NeoOS-TV/neoos-apps'
+        token: ${{ secrets.NEOTOKEN }}
+        fetch-depth: 0
+
+    - name: Node.js einrichten
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: webOS TV CLI installieren
+      run: npm install -g @webos-tools/cli
+
+    - name: App auslesen & verpacken
+      id: app_meta
+      run: |
+        FOLDER="${{ github.event.inputs.app_folder }}"
+        
+        if [ -f "$FOLDER/appinfo.json" ]; then
+          APP_ID=$(jq -r '.id' "$FOLDER/appinfo.json")
+          APP_TITLE=$(jq -r '.title' "$FOLDER/appinfo.json")
+          APP_VERSION=$(jq -r '.version' "$FOLDER/appinfo.json")
+        else
+          echo "::error::Keine appinfo.json im angegebenen Ordner gefunden!"
+          exit 1
+        fi
+        
+        echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
+        echo "app_title=$APP_TITLE" >> $GITHUB_OUTPUT
+        echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
+        
+        mkdir -p /tmp/release-assets
+        
+        # Nutzen des Icons direkt aus dem ausgecheckten App-Ordner
+        if [ -f "$FOLDER/icon.png" ]; then
+          cp "$FOLDER/icon.png" /tmp/release-assets/icon.png
+        else
+          touch /tmp/release-assets/icon.png
+        fi
+
+        echo "📦 Verpacke webOS App-Version..."
+        ares-package $FOLDER
+        
+        EXPECTED_IPK="${APP_ID}_${APP_VERSION}_all.ipk"
+        if [ -f "$EXPECTED_IPK" ]; then
+          mv "$EXPECTED_IPK" /tmp/release-assets/
+        else
+          echo "::error::Die IPK-Datei $EXPECTED_IPK wurde von ares-package nicht erzeugt!"
+          exit 1
+        fi
+
+    # 2. Prüft ob das Secret geladen werden kann
+    - name: Token-Check
+      run: |
+        if [ -z "${{ secrets.NEOTOKEN }}" ]; then
+          echo "::error::Das Secret NEOTOKEN in mr-yaml ist leer!"
+          exit 1
+        else
+          echo "✅ Secret NEOTOKEN ist bereit."
+        fi
+
+    # 3. Erstellt das Release direkt im Storage Repo und gibt die echte API-Antwort aus
+    - name: Release im Speicher-Repository erstellen
+      run: |
+        echo "🚀 Erstelle Release im Storage-Repository..."
+        TAG="${{ steps.app_meta.outputs.app_id }}/${{ steps.app_meta.outputs.app_version }}"
+        TITLE="${{ steps.app_meta.outputs.app_title }}"
+        
+        # Sende POST an die API und fange die Antwort ab
+        API_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+          -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/NeoOS-TV/NeoStore-Storage/releases \
+          -d "{\"tag_name\":\"$TAG\",\"name\":\"$TITLE\",\"body\":\"Automatisches Remote-Release von mr-yaml.\"}")
+        
+        echo "--- GITHUB API ANTWORT ---"
+        echo "$API_RESPONSE"
+        echo "--------------------------"
+        
+        HTTP_STATUS=$(echo "$API_RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
+        RELEASE_ID=$(echo "$API_RESPONSE" | grep -v "HTTP_STATUS:" | jq -r '.id' 2>/dev/null || echo "null")
+        
+        if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ] || [ "$HTTP_STATUS" -ge 400 ]; then
+          echo "::error::GitHub API hat den Release-Request abgelehnt (Status $HTTP_STATUS)!"
+          exit 1
+        fi
+        
+        for FILE in /tmp/release-assets/*; do
+          FILENAME=$(basename "$FILE")
+          echo "Uploade Asset: $FILENAME..."
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.NEOTOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/NeoOS-TV/NeoStore-Storage/releases/$RELEASE_ID/assets?name=$FILENAME" \
+            --data-binary @"$FILE"
+        done
+        echo "✅ Release und alle Assets erfolgreich hochgeladen!"
